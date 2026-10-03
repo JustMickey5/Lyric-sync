@@ -248,7 +248,7 @@
   <div class="vbox">
     <div id="vidMsg">Recording…</div>
     <canvas id="vidCanvas"></canvas>
-    <small>It records in real time, so it takes as long as the song. Keep this tab open and on screen until it finishes.</small>
+    <small>It records in real time, so it takes as long as the song. Keep this tab open and on screen, and don't lock the iPad, until it finishes.</small>
     <div class="row">
       <button class="primary" id="vidStop">Stop &amp; save</button>
       <button id="vidCancel">Cancel</button>
@@ -648,7 +648,9 @@ async function startVideo() {
   const L = vidLayout($('vidShape').value, hasLyrics);
   const cv = $('vidCanvas'); cv.width = L.W; cv.height = L.H;
   const c = cv.getContext('2d');
-  const hasFilter = 'filter' in c;
+  // iPads/iPhones struggle with live blur while recording, so there the lyrics just fade instead
+  const lite = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.maxTouchPoints > 1 && /Mac/.test(navigator.platform));
+  const hasFilter = 'filter' in c && !lite;
   const img = await vidLoadCover();
   const title = $('title').value.trim() || 'Untitled';
   const artistLine = [$('artist').value.trim(), $('version').value.trim()].filter(Boolean).join(' • ');
@@ -684,9 +686,9 @@ async function startVideo() {
     });
   }
 
-  function frame() {
-    const t = audio.currentTime, dur = audio.duration || 1;
-    c.clearRect(0, 0, L.W, L.H);
+  // everything that never changes (background, cover, title, artist) is drawn once, not every frame
+  const statLayer = document.createElement('canvas'); statLayer.width = L.W; statLayer.height = L.H;
+  (function drawStatic(c) {
     c.drawImage(bg, 0, 0);
 
     // cover
@@ -712,6 +714,13 @@ async function startVideo() {
       c.fillStyle = 'rgba(255,255,255,.7)'; c.font = '26px ' + VID_FONT;
       c.fillText(vidFit(c, artistLine, L.tw), L.tx, L.ay);
     }
+
+  })(statLayer.getContext('2d'));
+
+  function frame() {
+    const t = audio.currentTime, dur = audio.duration || 1;
+    c.clearRect(0, 0, L.W, L.H);
+    c.drawImage(statLayer, 0, 0);
 
     // progress bar + times
     const b = L.bar, p = Math.min(1, t / dur);
@@ -781,12 +790,14 @@ async function startVideo() {
 
   const prev = { rate: audio.playbackRate, vol: audio.volume };
   audio.playbackRate = 1; audio.volume = 1;
-  const chunks = []; let discard = false, raf = 0;
+  const chunks = []; let discard = false, raf = 0, timer = 0, wake = null;
   rec.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
   const onEnd = () => { if (rec.state !== 'inactive') rec.stop(); };
   audio.addEventListener('ended', onEnd);
   rec.onstop = () => {
     cancelAnimationFrame(raf);
+    clearInterval(timer);
+    if (wake) { try { wake.release(); } catch (err) {} }
     audio.removeEventListener('ended', onEnd);
     try { mediaSrc.disconnect(dest); } catch (err) {}
     audio.pause(); audio.playbackRate = prev.rate; audio.volume = prev.vol;
@@ -811,10 +822,22 @@ async function startVideo() {
   st.textContent = '';
   $('vidOverlay').classList.remove('hidden');
   audio.currentTime = 0;
-  frame();
-  rec.start();
-  const loop = () => { frame(); raf = requestAnimationFrame(loop); };
+  try { if (navigator.wakeLock) wake = await navigator.wakeLock.request('screen'); } catch (err) {}   // stop the screen auto-locking
+  let lastDraw = 0, errShown = false;
+  const safeFrame = () => {
+    const now = performance.now();
+    if (now - lastDraw < 25) return;
+    lastDraw = now;
+    try { frame(); }
+    catch (err) {
+      if (!errShown) { errShown = true; console.error(err); $('vidMsg').textContent = 'Drawing hiccup: ' + (err && err.message ? err.message : err); }
+    }
+  };
+  safeFrame();
+  rec.start(1000);
+  const loop = () => { raf = requestAnimationFrame(loop); safeFrame(); };
   loop();
+  timer = setInterval(safeFrame, 33);   // keeps drawing even if the browser pauses animation frames
   audio.play().catch(() => {});
 }
 $('vidBtn').addEventListener('click', startVideo);
